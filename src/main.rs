@@ -181,9 +181,16 @@ fn install(login: bool) {
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache.
-    let _ = std::fs::remove_file(&bin);
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    // path can be SIGKILLed by the code-signing cache. Copy beside it and
+    // rename, so running `install` from the installed copy stays a no-op
+    // instead of deleting the source it is reading.
+    let src = std::env::current_exe().unwrap();
+    let same = std::fs::canonicalize(&src).ok() == std::fs::canonicalize(&bin).ok();
+    if !same {
+        let tmp = bin.with_extension("new");
+        std::fs::copy(&src, &tmp).unwrap_or_else(|e| die(&format!("copy: {e}")));
+        std::fs::rename(&tmp, &bin).unwrap_or_else(|e| die(&format!("rename: {e}")));
+    }
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
