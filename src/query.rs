@@ -44,8 +44,11 @@ const TYPO_MIN_LEN: usize = 5;
 /// What a typo costs, so clean matches of the same quality rank first.
 const TYPO_COST: i32 = 60;
 
+/// A typo only stays a typo in a word long enough that one wrong letter is not
+/// another word. ASCII only: for CJK a wrong byte is a third of a character,
+/// and one wrong character in a two-character word is a different word.
 fn takes_typos(text: &[u8], mode: Mode) -> bool {
-    mode == Mode::Fuzzy && text.len() >= TYPO_MIN_LEN
+    mode == Mode::Fuzzy && !wide_text(text) && text.len() >= TYPO_MIN_LEN
 }
 
 #[derive(Clone, Default)]
@@ -405,7 +408,7 @@ fn bonus(prev: Class, cur: Class) -> i32 {
 /// fzf-v1 style: leftmost-ending match, shrunk from the right, then scored
 /// with boundary/camel/consecutive bonuses. Returns None when no match.
 pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
-    fuzzy_score_capped(name, q, 100)
+    if wide_text(q) { fuzzy_score_chars(name, q, 100) } else { fuzzy_score_capped(name, q, 100) }
 }
 
 /// `fuzzy_score` with the whole-name/stem/prefix bonus capped at `cap`.
@@ -482,6 +485,73 @@ fn rfind_folded(s: &[u8], c: u8) -> Option<usize> {
     if c.is_ascii_lowercase() { memchr::memrchr2(c, c - 32, s) } else { memchr::memrchr(c, s) }
 }
 
+/// Does this token hold a character that is more than one byte long? Such a
+/// token is matched character by character: matching bytes alone would take the
+/// last two bytes of one character and the first of the next, and in CJK text
+/// that is a match nobody asked for.
+#[inline(always)]
+fn wide_text(q: &[u8]) -> bool {
+    q.iter().any(|&b| b >= 0x80)
+}
+
+/// Byte length of the character that starts with byte `b`. Stray continuation
+/// bytes, which only a name that is not valid UTF-8 holds, count as one.
+#[inline(always)]
+fn char_width(b: u8) -> usize {
+    match b {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// Start of the character that ends at `at`, where `at` is a character boundary
+/// (the end of a token).
+#[inline(always)]
+fn char_start(q: &[u8], at: usize) -> usize {
+    let mut s = at - 1;
+    while s > 0 && q[s] & 0xC0 == 0x80 {
+        s -= 1;
+    }
+    s
+}
+
+/// Byte offset of the first character at or after `from` that spells `c`, the
+/// bytes of one whole character of the query, ending before `limit`.
+///
+/// The search is still memchr for `c`'s first byte, and alignment comes for
+/// free: every byte at or above 0x80 in a name is a lead byte or a continuation
+/// byte, continuation bytes are at most 0xBF, so a hit on the first byte of a
+/// multi-byte character can only land on a character boundary, and ASCII bytes
+/// cannot appear inside a longer character at all.
+#[inline(always)]
+fn find_char(name: &[u8], from: usize, limit: usize, c: &[u8]) -> Option<usize> {
+    let mut at = from;
+    while at < limit {
+        let i = at + find_folded(&name[at..limit], c[0])?;
+        if i + c.len() <= limit && name[i..i + c.len()].iter().zip(c).all(|(&a, &b)| fold(a) == b) {
+            return Some(i);
+        }
+        at = i + 1;
+    }
+    None
+}
+
+/// Last character ending at or before `upto` that spells `c`.
+#[inline(always)]
+fn rfind_char(name: &[u8], upto: usize, c: &[u8]) -> Option<usize> {
+    let mut at = upto;
+    while at > 0 {
+        let i = rfind_folded(&name[..at], c[0])?;
+        if i + c.len() <= at && name[i..i + c.len()].iter().zip(c).all(|(&a, &b)| fold(a) == b) {
+            return Some(i);
+        }
+        at = i;
+    }
+    None
+}
+
 /// `fuzzy_score` for a one-byte query matched at `i`: the general scoring
 /// loop collapses to one step.
 #[inline]
@@ -500,6 +570,113 @@ fn single_score(name: &[u8], i: usize, cap: i32) -> i32 {
         });
     }
     score - (name.len() as i32).min(80) / 3
+}
+
+/// `single_score` for a matched character of more than one byte: the byte
+/// version measures what follows the match from a one-byte assumption.
+#[inline]
+fn single_score_span(name: &[u8], start: usize, end: usize, cap: i32) -> i32 {
+    let prev = if start == 0 { Class::Delim } else { class(name[start - 1]) };
+    let mut score = SCORE_MATCH + bonus(prev, class(name[start])) * 2;
+    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    if start == off {
+        let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
+        score += cap.min(if end == name.len() {
+            100
+        } else if end == stem {
+            80
+        } else {
+            30
+        });
+    }
+    score - (name.len() as i32).min(80) / 3
+}
+
+/// `fuzzy_score` over characters instead of bytes: the same scoring, with one
+/// whole character per query unit, so a match cannot straddle characters and
+/// `海鹏` cannot be spelled out of the bytes of `海莉` and `麦克`.
+///
+/// Kept in step with `fuzzy_score_capped`, which owns the ASCII path and must
+/// stay byte-for-byte identical: two copies of the scoring loop are cheaper to
+/// maintain than one loop with a branch in it.
+fn fuzzy_score_chars(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+    // Leftmost-ending match: jump to each whole query character in turn.
+    let mut end = 0;
+    let mut from = 0;
+    let mut at = 0;
+    let mut start = 0;
+    let mut units = 0;
+    while at < q.len() {
+        let w = char_width(q[at]).min(q.len() - at);
+        let i = find_char(name, from, name.len(), &q[at..at + w])?;
+        if units == 0 {
+            start = i;
+        }
+        end = i + w;
+        from = end;
+        at += w;
+        units += 1;
+    }
+    if units == 1 {
+        return Some(single_score_span(name, start, end, cap));
+    }
+    // Shrink from the right: the latest start that still ends at `end`.
+    let mut latest = end;
+    let mut at = q.len();
+    while at > 0 {
+        let s = char_start(q, at);
+        latest = rfind_char(name, latest, &q[s..at])?;
+        at = s;
+    }
+    let start = latest;
+    // Score the greedy match from `start`, jumping between matched characters:
+    // each gap costs GAP_START then GAP_EXT per byte, a run of consecutive
+    // matches carries its strongest boundary bonus along.
+    let mut score = 0;
+    let (mut m, mut first_bonus) = (start, 0);
+    let mut after = start;
+    let mut at = 0;
+    let mut k = 0;
+    while at < q.len() {
+        let w = char_width(q[at]).min(q.len() - at);
+        let mut run = false;
+        if k > 0 {
+            let i = find_char(name, after, end, &q[at..at + w])?;
+            run = i == after;
+            if !run {
+                score += GAP_START + (i - after) as i32 * GAP_EXT;
+            }
+            m = i;
+        }
+        let prev = if m == 0 { Class::Delim } else { class(name[m - 1]) };
+        let mut b = bonus(prev, class(name[m]));
+        if run {
+            if b >= BONUS_BOUNDARY && b > first_bonus {
+                first_bonus = b;
+            }
+            b = b.max(first_bonus).max(BONUS_CONSEC);
+        } else {
+            first_bonus = b;
+        }
+        score += SCORE_MATCH + if k == 0 { b * 2 } else { b };
+        after = m + w;
+        at += w;
+        k += 1;
+    }
+    // Whole-name and stem matches are what people mean most of the time.
+    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
+    let contiguous = end - start == q.len();
+    let placed = if start == off && contiguous && end == name.len() {
+        100
+    } else if start == off && contiguous && end == stem {
+        80
+    } else if start == off && contiguous {
+        30
+    } else {
+        0
+    };
+    Some(score + placed.min(cap) - (name.len() as i32).min(80) / 3)
 }
 
 /// Best score for `q` read with one typo (see `one_edit_prefix`) at the
@@ -1249,4 +1426,60 @@ fn rank_tweaks(flags: u8, kind: u8, mtime: u32, now: u32) -> i32 {
         _ => 0,
     };
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CJK text as it lands in a filename. The byte path used to match `海鹏`
+    /// here by taking two bytes from `海莉`, one from `麦`, one from `书` and
+    /// one from `口`, across 93 bytes.
+    const NOISE: &str = "年龄是一种感觉(文字转换版) -- 海莉·麦克吉, 新华书店北美网 -- 2024 -- 海口：南海出版公司";
+
+    #[test]
+    fn cjk_matches_whole_characters() {
+        assert!(fuzzy_score("海鹏.xlsx".as_bytes(), "海鹏".as_bytes()).is_some());
+        assert!(fuzzy_score("海-鹏.txt".as_bytes(), "海鹏".as_bytes()).is_some());
+        assert!(fuzzy_score("备份/海鹏.docx".as_bytes(), "海鹏".as_bytes()).is_some());
+    }
+
+    #[test]
+    fn cjk_does_not_match_across_characters() {
+        assert!(fuzzy_score(NOISE.as_bytes(), "海鹏".as_bytes()).is_none());
+        assert!(fuzzy_score("海莉".as_bytes(), "海鹏".as_bytes()).is_none());
+        assert!(fuzzy_score("海口".as_bytes(), "海鹏".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn whole_name_beats_a_gappy_match() {
+        let exact = fuzzy_score("海鹏".as_bytes(), "海鹏".as_bytes()).unwrap();
+        let gappy = fuzzy_score("海-鹏-备份".as_bytes(), "海鹏".as_bytes()).unwrap();
+        assert!(exact > gappy, "{exact} !> {gappy}");
+    }
+
+    #[test]
+    fn ascii_still_matches_by_byte() {
+        assert!(fuzzy_score(b"main.rs", b"main").is_some());
+        assert!(fuzzy_score(b"path/to/main.rs", b"pmrs").is_some());
+        assert!(fuzzy_score(b"main.rs", b"mian").is_none());
+        assert!(fuzzy_score(b"", b"x").is_none());
+    }
+
+    #[test]
+    fn mixed_tokens_step_by_unit() {
+        assert!(fuzzy_score("海鹏.rs".as_bytes(), "海rs".as_bytes()).is_some());
+        assert!(fuzzy_score("海鹏.rs".as_bytes(), "鹏.rs".as_bytes()).is_some());
+        assert!(fuzzy_score("海鹏.rs".as_bytes(), "鹏.rd".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn typos_are_ascii_only() {
+        assert!(takes_typos(b"manifest", Mode::Fuzzy));
+        assert!(!takes_typos(b"abcd", Mode::Fuzzy));
+        assert!(!takes_typos("海鹏".as_bytes(), Mode::Fuzzy));
+        assert!(!takes_typos("银行账户批量付款".as_bytes(), Mode::Fuzzy));
+        // One wrong character is a different word, not a typo of this one.
+        assert!(fuzzy_score("海朋".as_bytes(), "海鹏".as_bytes()).is_none());
+    }
 }

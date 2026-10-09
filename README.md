@@ -25,6 +25,11 @@ fsearch 'ext:rs grep:apply_dir'   # search inside files
   改为等待接管，而不是退出——原来退出会让 launchd 的 `KeepAlive` 每 10 秒重启一次，日志刷屏。
 - **未就绪提示区分两种状态**：首次建索引（`first run scans the whole disk`）与装载已有索引
   （`loading the index and replaying changes`）。
+- **CJK 按整字匹配**：上游的模糊匹配是字节级子序列，中文名里会把互不相干的汉字拆成字节拼一个命中
+  （`fsearch 海鹏` 会连带 `海莉·麦克吉`、`海口…` 那几条，分数 61，靠 ranking 才沉在后面）。现在含多字节
+  字符的查询按整字匹配：仍是子序列（允许跳跃、仍用 memchr 找首字节），但不跨字，也不会取某个汉字的
+  第 2、3 字节。代价是 CJK 不再吃"一个错字"容忍——按字节算一个"错字"等于错三分之一字，按字算才是真的
+  错字，留作后续。
 
 ## Speed
 
