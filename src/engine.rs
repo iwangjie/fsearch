@@ -54,6 +54,9 @@ pub struct Found {
 pub struct Status {
     #[serde(skip)]
     pub ready: bool,
+    /// Nothing on disk yet: the first crawl is what's taking the time.
+    #[serde(skip)]
+    pub building: bool,
     pub entries: usize,
     pub dirs: usize,
     pub overlay: usize,
@@ -95,6 +98,8 @@ struct Shared {
     stream: Mutex<Option<fsevents::Stream>>,
     /// The stream is still replaying history (until HISTORY_DONE).
     replaying: AtomicBool,
+    /// No index was on disk at startup: the first crawl is running.
+    building: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
 }
@@ -181,9 +186,11 @@ impl Engine {
             lock,
             stream: Mutex::new(None),
             replaying: AtomicBool::new(true),
+            building: AtomicBool::new(false),
             content_seen: Mutex::new(None),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
+        shared.building.store(base.is_none(), Ordering::Relaxed);
         let since = match &base {
             Some(b) if b.event_id != 0 => b.event_id,
             _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
@@ -227,7 +234,7 @@ impl Engine {
     /// Name search.
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
         let g = self.s.live.read().unwrap();
-        let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
+        let Some(live) = g.as_ref() else { return Err(self.not_ready()) };
         let mut p = Vec::new();
         Ok(search_pool()
             .install(|| Searcher { live }.search(q))
@@ -263,7 +270,7 @@ impl Engine {
         // be slow and a waiting writer would stall every other query.
         let paths = {
             let l = self.s.live.read().unwrap();
-            let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
+            let Some(live) = l.as_ref() else { return Err(self.not_ready()) };
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
         Ok((content::verify(g, &paths, q.limit), false))
@@ -274,6 +281,7 @@ impl Engine {
         let c = self.s.content.read().unwrap();
         Status {
             ready: l.is_some(),
+            building: self.s.building.load(Ordering::Relaxed),
             entries: l.as_ref().map_or(0, |l| l.base.n),
             dirs: l.as_ref().map_or(0, |l| l.base.d),
             overlay: l.as_ref().map_or(0, |l| l.over.len()),
@@ -296,7 +304,17 @@ impl Engine {
     }
 }
 
-const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
+impl Engine {
+    /// Why we are not ready yet: either the first crawl is running, or an index
+    /// on disk is being loaded and the events since then replayed.
+    pub fn not_ready(&self) -> String {
+        if self.s.building.load(Ordering::Relaxed) {
+            "indexing (first run scans the whole disk, ~20s)".to_string()
+        } else {
+            "indexing (loading the index and replaying changes)".to_string()
+        }
+    }
+}
 
 impl Shared {
     fn owner(&self) -> bool {

@@ -13,14 +13,26 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
-pub fn serve(dir: PathBuf, home: String) {
+pub fn serve(dir: PathBuf, home: String, wait: bool) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
     let Ok(lock) = std::fs::File::create(dir.join("socket.lock")) else { return };
     if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
-        return;
+        // A login item races with a daemon a CLI already started, and launchd
+        // restarts a `KeepAlive` job forever: exiting here would spawn a new
+        // process every ten seconds. Wait for the other daemon instead. On
+        // demand daemons still exit, since their caller reconnects.
+        if !wait {
+            eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
+            return;
+        }
+        eprintln!("{} another fsearch daemon is running, waiting for it", fsearch::query::now_secs());
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&lock);
+        while unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+        eprintln!("{} took over from the other daemon", fsearch::query::now_secs());
     }
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
@@ -82,7 +94,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
         "status" => {
             let s = engine.status();
             if !s.ready {
-                return Err("indexing (first run scans the whole disk, ~20s)".into());
+                return Err(engine.not_ready());
             }
             let mut v = serde_json::to_value(s).map_err(|e| e.to_string())?;
             v["ok"] = true.into();

@@ -54,7 +54,8 @@ static GLOBAL: Alloc = Alloc;
 const USAGE: &str = "usage:
   fsearch <query...> [--json]   search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
-  fsearch serve                 run the daemon in the foreground
+  fsearch serve [--wait]        run the daemon in the foreground (--wait: keep
+                                waiting while another daemon holds the socket)
   fsearch status
   fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
                                 (needs Full Disk Access granted to ~/.local/bin/fsearch)
@@ -85,7 +86,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
-        Some("serve") => server::serve(data_dir(), home()),
+        Some("serve") => server::serve(data_dir(), home(), args.iter().any(|a| a == "--wait")),
         Some("stdio") => stdio(),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
@@ -202,7 +203,7 @@ fn install(login: bool) {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
+  <key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>--wait</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{}</string>
