@@ -162,6 +162,7 @@ impl Engine {
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
         }
+        crate::ignore::init(std::path::Path::new(&opts.home), &opts.dir);
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();

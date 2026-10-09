@@ -644,10 +644,13 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
         return false;
     }
     let rel = rest.strip_prefix(b"/").unwrap_or(rest);
+    if crate::ignore::blocks_dir(path) {
+        return false;
+    }
     if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
         return false;
     }
-    !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
+    !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || crate::ignore::blocks_name(c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.

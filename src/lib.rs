@@ -4,6 +4,7 @@
 //! a daemon with a JSON-lines socket.
 
 pub mod content;
+pub mod ignore;
 mod engine;
 mod fsevents;
 pub mod index;

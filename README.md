@@ -61,6 +61,26 @@ login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
 grant in System Settings > Privacy & Security, again after each rebuild.
 Without access it skips the protected folders instead of popping a prompt.
 
+## Ignoring
+
+Indexing costs CPU per change event, not per entry, so subtrees that belong to
+the machine — caches, logs, `/private/var`, volume metadata, and the index's own
+directory — are skipped before they are ever opened. Add your own rules in
+`~/Library/Application Support/FSearch/ignore`:
+
+```
+~/work/scratch        a subtree, home-relative
+/opt/big-thing        a subtree, absolute
+node_modules          any file or directory with this name, at any depth
+!~/Library/Caches/x   take a rule back, or carve a hole in an ignored tree
+```
+
+`#` starts a comment. Restart the daemon to pick the file up (`pkill -f
+'fsearch serve'`; it comes back on the next query, or launchd restarts it when
+installed with `--login`). Entries already in the index go away as their
+directories change, or immediately after deleting `index.bin` and `content/` for
+a fresh crawl.
+
 ## API
 
 JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or

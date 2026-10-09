@@ -19,6 +19,11 @@ pub const NONE: u32 = u32::MAX;
 pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 pub fn blocked(path: &[u8]) -> bool {
+    gated(path) || crate::ignore::blocks_dir(path)
+}
+
+/// Folders we may not even open: consent-gated, or the ignore rules.
+fn gated(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
 }
 
@@ -69,7 +74,8 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.
-    let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
+    let tracking = crate::ignore::active() || SKIP.get().is_some_and(|v| !v.is_empty());
+    let path = tracking.then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
@@ -232,6 +238,9 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
         size = rd64(b, f);
     }
     if name.is_empty() || name.len() > u16::MAX as usize {
+        return;
+    }
+    if crate::ignore::blocks_name(name) {
         return;
     }
     l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
