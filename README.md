@@ -1,4 +1,8 @@
-# FSearch
+# FSearch — macOS 定制优化版
+
+`iwangjie/fsearch` 维护的定制分支，基于上游
+[noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch)。
+上游的能力照旧，改动见下面一节。
 
 Whole-disk file search for macOS. Finds any file by name in about a
 millisecond, forgives typos, and searches inside files with an index. Use it
@@ -9,6 +13,18 @@ cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fs
 fsearch fsearch main              # find files by name
 fsearch 'ext:rs grep:apply_dir'   # search inside files
 ```
+
+## 相对上游的改动
+
+- **忽略规则**：属于机器的子树在打开之前就跳过，不再产生事件与索引条目——缓存、日志、
+  `/private/var`、卷元数据、索引自己的目录，外加可配置的名字规则（`.DS_Store`、`Caches` 等）。
+  规则文件：`~/Library/Application Support/FSearch/ignore`，`!` 可反撤销。见下面 "Ignoring"。
+- **`install` 不再删掉正在运行的自己**：改成写到目标旁边的临时文件再 `rename()`；从已安装的副本
+  执行 `install` 是幂等空操作（原来会先 `remove_file` 自己，再从已被删除的路径 `copy`，必然 ENOENT）。
+- **登录项不再空转重启**：`install --login` 生成的 plist 用 `serve --wait`。抢不到 socket 的 daemon
+  改为等待接管，而不是退出——原来退出会让 launchd 的 `KeepAlive` 每 10 秒重启一次，日志刷屏。
+- **未就绪提示区分两种状态**：首次建索引（`first run scans the whole disk`）与装载已有索引
+  （`loading the index and replaying changes`）。
 
 ## Speed
 
